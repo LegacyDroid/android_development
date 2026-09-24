@@ -10,7 +10,7 @@ attribution, and graceful process management.
 Exit codes:
   0 = Clean
   1 = Errors present
-  2 = Warnings only (--werror or --fail-on-warning)
+  2 = Warnings only
   3 = Usage / tool error
   130 = Interrupted
 """
@@ -419,6 +419,19 @@ def run_clang_file(
         out_b, err_b = proc.communicate(timeout=args.timeout if args.timeout > 0 else None)
         raw = (err_b or b"").decode("utf-8", "replace") + (out_b or b"").decode("utf-8", "replace")
         diags = parse_clang_output(raw, args.strict_context)
+        if proc.returncode != 0 and not any(
+            d.severity in {"error", "warning", "context"} for d in diags
+        ):
+            diags.append(
+                Diagnostic(
+                    str(path),
+                    0,
+                    0,
+                    "error",
+                    "aospcheck",
+                    f"Compiler exited with status {proc.returncode} without a diagnostic.",
+                )
+            )
         return diags, time.time() - t0, proc.returncode
     except subprocess.TimeoutExpired:
         try:
@@ -453,6 +466,12 @@ def build_argparser():
     ap.add_argument("--strict-context", action="store_true", help="Treat missing headers/symbols as real errors.")
     ap.add_argument("--hide-context", action="store_true", help="Hide missing dependency/symbol diagnostics.")
     ap.add_argument("-Werror", "--werror", action="store_true", help="Treat warnings as errors.")
+    ap.add_argument(
+        "--fail-on-warning",
+        dest="werror",
+        action="store_true",
+        help="Treat warnings as errors (same as --werror).",
+    )
     ap.add_argument("--timeout", type=float, default=120.0, help="Timeout per file in seconds.")
     ap.add_argument("--json", help="Write JSON report to file.")
     ap.add_argument("-q", "--quiet", action="store_true", help="Suppress progress and banners.")

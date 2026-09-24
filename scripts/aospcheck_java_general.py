@@ -9,7 +9,7 @@ caret-accurate column parsing, and graceful process management.
 Exit codes:
   0 = Clean
   1 = Errors present
-  2 = Warnings only (--werror or --fail-on-warning)
+  2 = Warnings only
   3 = Usage / tool error
   130 = Interrupted
 """
@@ -209,22 +209,40 @@ def find_javac(root: Optional[Path], override: Optional[str]) -> Tuple[Optional[
         if p.is_file():
             return p, p.parent.parent
         if p.is_dir():
-            return p / ("javac.exe" if os.name == "nt" else "javac"), p
+            exe = p / ("javac.exe" if os.name == "nt" else "javac")
+            return (exe, p) if exe.is_file() else (None, None)
         return None, None
+
     if root:
+        candidates = []
+
+        android_java_home = os.environ.get("ANDROID_JAVA_HOME")
+        if android_java_home:
+            home = Path(android_java_home).expanduser()
+            exe = home / "bin" / ("javac.exe" if os.name == "nt" else "javac")
+            if exe.is_file():
+                candidates.append((0, 0, 0, exe))
+
         base = root / "prebuilts" / "jdk"
         if base.is_dir():
-            best = None
             for jd in base.iterdir():
                 if not jd.is_dir():
                     continue
-                m = re.search(r"jdk(\d+)", jd.name)
-                n = int(m.group(1)) if m else 0
-                for exe in jd.glob(f"*/bin/javac{' .exe' if os.name == 'nt' else ''}"):
-                    if exe.is_file() and (best is None or n > best[0]):
-                        best = (n, exe)
-            if best:
-                return best[1], best[1].parent.parent
+                match = re.fullmatch(r"jdk(\d+)", jd.name)
+                version = int(match.group(1)) if match else 0
+                jdk_preference = 0 if jd.name == "jdk17" else 1
+                for exe in jd.glob(
+                    f"*/bin/{'javac.exe' if os.name == 'nt' else 'javac'}"
+                ):
+                    if exe.is_file():
+                        host_preference = 0 if exe.parent.parent.name == host_tag() else 1
+                        candidates.append((jdk_preference, host_preference, -version, exe))
+
+        for _, _, _, exe in sorted(
+            candidates, key=lambda item: (item[0], item[1], item[2], str(item[3]))
+        ):
+            return exe, exe.parent.parent
+
     w = shutil.which("javac")
     return (Path(w), None) if w else (None, None)
 
@@ -232,9 +250,7 @@ def find_javac(root: Optional[Path], override: Optional[str]) -> Tuple[Optional[
 def find_kotlinc(root: Optional[Path], override: Optional[str]) -> Optional[Path]:
     if override:
         p = Path(override).expanduser()
-        if p.exists():
-            return p
-        return None
+        return p if p.is_file() else None
     if root:
         patterns = (
             "prebuilts/sdk/current/kotlinc/bin/kotlinc*",
@@ -423,6 +439,19 @@ def run_java_batch(task: BatchTask, javac_bin: Path, args: argparse.Namespace, r
 
         raw, rc, dur, err_diag = run_process_capture(cmd, str(root) if root else None, env, args.timeout, task.label)
         diags = ([err_diag] if err_diag else []) + parse_javac(raw, args.strict_context)
+        if rc != 0 and not any(
+            d.severity in {"error", "warning", "context"} for d in diags
+        ):
+            diags.append(
+                Diagnostic(
+                    task.label,
+                    0,
+                    0,
+                    "error",
+                    "aospcheck",
+                    f"javac exited with status {rc} without a diagnostic.",
+                )
+            )
         return TaskResult(task=task, diags=diags, raw=raw, cmd=cmd, rc=rc, duration=dur)
 
 
@@ -449,6 +478,19 @@ def run_kotlin_batch(task: BatchTask, kotlinc_bin: Path, args: argparse.Namespac
 
         raw, rc, dur, err_diag = run_process_capture(cmd, str(root) if root else None, env, args.timeout, task.label)
         diags = ([err_diag] if err_diag else []) + parse_kotlin(raw, args.strict_context)
+        if rc != 0 and not any(
+            d.severity in {"error", "warning", "context"} for d in diags
+        ):
+            diags.append(
+                Diagnostic(
+                    task.label,
+                    0,
+                    0,
+                    "error",
+                    "aospcheck",
+                    f"kotlinc exited with status {rc} without a diagnostic.",
+                )
+            )
         return TaskResult(task=task, diags=diags, raw=raw, cmd=cmd, rc=rc, duration=dur)
 
 
@@ -514,10 +556,28 @@ def build_argparser():
     ap.add_argument("--kotlin-jvm-target", default="17", help="kotlinc -jvm-target.")
     ap.add_argument("--javac-flag", action="append", default=[], help="Extra javac flag. Repeatable.")
     ap.add_argument("--kotlinc-flag", action="append", default=[], help="Extra kotlinc flag. Repeatable.")
-    ap.add_argument("--aosp-default-classpath", action="store_true", default=True, help="Include heuristic out/ target framework jars.")
+    ap.add_argument(
+        "--aosp-default-classpath",
+        dest="aosp_default_classpath",
+        action="store_true",
+        default=True,
+        help="Include heuristic out/ target framework jars.",
+    )
+    ap.add_argument(
+        "--no-aosp-default-classpath",
+        dest="aosp_default_classpath",
+        action="store_false",
+        help="Do not include heuristic out/ target framework jars.",
+    )
     ap.add_argument("--strict-context", action="store_true", help="Escalate missing symbol/package warnings into errors.")
     ap.add_argument("--hide-context", action="store_true", help="Hide missing dependency/symbol diagnostics.")
     ap.add_argument("-Werror", "--werror", action="store_true", help="Treat warnings as errors.")
+    ap.add_argument(
+        "--fail-on-warning",
+        dest="werror",
+        action="store_true",
+        help="Treat warnings as errors (same as --werror).",
+    )
     ap.add_argument("--timeout", type=float, default=240.0, help="Timeout per batch in seconds.")
     ap.add_argument("--json", help="Write JSON report to file.")
     ap.add_argument("-q", "--quiet", action="store_true", help="Suppress progress and banners.")
@@ -570,6 +630,20 @@ def main(argv=None) -> int:
             java_sources.append(SourceFile(path=p, lang="java", package=extract_package(p)))
         else:
             kotlin_sources.append(SourceFile(path=p, lang="kotlin", package=extract_package(p)))
+
+    missing_compilers = []
+    if java_sources and not javac_bin:
+        missing_compilers.append("javac")
+    if kotlin_sources and not kotlinc_bin:
+        missing_compilers.append("kotlinc")
+    if missing_compilers:
+        print(
+            "Required compiler(s) not found: "
+            + ", ".join(missing_compilers)
+            + ". Set --javac/--kotlinc or provide an AOSP tree.",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
 
     tasks: List[BatchTask] = []
 
